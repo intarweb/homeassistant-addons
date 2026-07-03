@@ -1,0 +1,154 @@
+name: build-filament-manager
+
+# Ephemeral assembly build for the intarweb Filament Manager add-on image.
+#
+# Model (Justin's fork law, 2026-07-02): the code fork intarweb/filament-manager
+# stays a PURE mirror of cgradl/filament-manager master (ahead_by=0) with ONLY
+# open-PR branches — never a deploy branch, never our commits on master. The
+# deployable ":latest" is assembled EPHEMERALLY here at build time from
+# `master + every open intarweb->upstream PR`, built, pushed, and the tree
+# discarded. This workflow lives in the manifest repo (not the fork) so the fork
+# needs no workflow file of its own, and the version bump is a same-repo commit
+# (no cross-repo PAT).
+#
+# HA consumes ghcr.io/intarweb/filament-manager:<version> where <version> is this
+# repo's filament_manager/config.yaml `version`. So the image is tagged with the
+# EXACT version string and config.yaml is bumped to match in the same run.
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'   # "on a clock" — every 6h catch-all
+  workflow_dispatch: {}
+
+permissions:
+  contents: write     # bump this repo's config.yaml version
+  packages: write     # push to ghcr.io/intarweb/*
+
+concurrency:
+  group: build-filament-manager
+  cancel-in-progress: false
+
+env:
+  CODE_REPO: intarweb/filament-manager
+  UPSTREAM: cgradl/filament-manager
+  IMAGE: ghcr.io/intarweb/filament-manager
+  ADDON_DIR: filament_manager
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout manifest repo (for version bump)
+        uses: actions/checkout@v4
+        with:
+          path: manifest
+
+      - name: Checkout code fork (master mirror)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPO }}
+          ref: master
+          path: fork
+          fetch-depth: 0
+
+      - name: Enumerate open PRs + compute fingerprint
+        id: fp
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd fork
+          MAIN_SHA="$(git rev-parse HEAD)"
+          # Open PRs whose head is in the intarweb org (cross-repo PRs to upstream)
+          mapfile -t BRANCHES < <(gh pr list -R "$UPSTREAM" --state open \
+            --json headRefName,headRepositoryOwner \
+            --jq '.[] | select(.headRepositoryOwner.login=="intarweb") | .headRefName')
+          PR_SHAS=""
+          for b in "${BRANCHES[@]:-}"; do
+            [ -z "$b" ] && continue
+            git fetch --quiet origin "$b:pr/$b"
+            s="$(git rev-parse "pr/$b")"
+            PR_SHAS="$PR_SHAS $s"
+            echo "  PR branch $b -> $s"
+          done
+          SORTED="$(printf '%s\n' $PR_SHAS | sort | tr '\n' ' ')"
+          FP="$(printf '%s %s' "$MAIN_SHA" "$SORTED" | sha256sum | cut -c1-12)"
+          VER="$(grep -E '^version:' "$ADDON_DIR/config.yaml" | head -1 | sed -E 's/^version:[[:space:]]*"?([^"]+)"?.*/\1/')"
+          echo "fp=$FP"                       >> "$GITHUB_OUTPUT"
+          echo "branches=${BRANCHES[*]:-}"    >> "$GITHUB_OUTPUT"
+          echo "upstream_version=$VER"        >> "$GITHUB_OUTPUT"
+          echo "main_sha=$MAIN_SHA"           >> "$GITHUB_OUTPUT"
+          echo "### filament-manager build inputs" >> "$GITHUB_STEP_SUMMARY"
+          echo "- upstream master: \`$MAIN_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- open PR branches: \`${BRANCHES[*]:-<none>}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- fingerprint: \`sha-$FP\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: No-op check (fingerprint already published?)
+        id: noop
+        run: |
+          if docker manifest inspect "$IMAGE:sha-${{ steps.fp.outputs.fp }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Fingerprint sha-${{ steps.fp.outputs.fp }} already built — no-op, keeping current :latest." | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assemble (cherry-pick open PRs onto master)
+        if: steps.noop.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cd fork
+          git config user.name  "intarweb-ci"
+          git config user.email "ci@intarweb.invalid"
+          for b in ${{ steps.fp.outputs.branches }}; do
+            echo "Cherry-picking $b (master..pr/$b)"
+            if ! git cherry-pick "master..pr/$b"; then
+              git cherry-pick --abort || true
+              echo "::error::cherry-pick conflict on $b — build fails closed, last :latest keeps serving"
+              exit 1
+            fi
+          done
+
+      - name: Set up Buildx
+        if: steps.noop.outputs.skip == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.noop.outputs.skip == 'false'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build + push multi-arch image
+        if: steps.noop.outputs.skip == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: fork/${{ env.ADDON_DIR }}
+          file: fork/${{ env.ADDON_DIR }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:sha-${{ steps.fp.outputs.fp }}
+            ${{ env.IMAGE }}:${{ steps.fp.outputs.upstream_version }}.${{ github.run_number }}
+
+      - name: Bump manifest version to match published tag
+        if: steps.noop.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          cd manifest
+          NEWVER="${{ steps.fp.outputs.upstream_version }}.${{ github.run_number }}"
+          sed -i -E "s/^version:.*/version: \"$NEWVER\"/" "$ADDON_DIR/config.yaml"
+          git config user.name  "intarweb-ci"
+          git config user.email "ci@intarweb.invalid"
+          if git diff --quiet; then
+            echo "config.yaml version unchanged."
+          else
+            git add "$ADDON_DIR/config.yaml"
+            git commit -m "ci(filament_manager): publish $NEWVER (master + open PRs)"
+            git push
+            echo "Published \`$IMAGE:$NEWVER\` and bumped manifest version." >> "$GITHUB_STEP_SUMMARY"
+          fi
