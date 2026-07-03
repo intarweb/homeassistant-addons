@@ -6,10 +6,8 @@ url: "https://github.com/intarweb/filament-manager"
 image: "ghcr.io/intarweb/filament-manager"
 init: false
 arch:
-  - aarch64
   - amd64
-  - armhf
-  - armv7
+  - aarch64
 homeassistant_api: true
 ingress: true
 ingress_port: 8099
