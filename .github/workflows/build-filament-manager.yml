@@ -86,11 +86,24 @@ jobs:
       - name: No-op check (fingerprint already published?)
         id: noop
         run: |
-          if docker manifest inspect "$IMAGE:sha-${{ steps.fp.outputs.fp }}" >/dev/null 2>&1; then
+          set -uo pipefail
+          FP="sha-${{ steps.fp.outputs.fp }}"
+          # Anonymous ghcr registry token (works for public packages; no secret needed).
+          TOKEN="$(curl -sf 'https://ghcr.io/token?scope=repository:intarweb/filament-manager:pull' \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin).get("token",""))' 2>/dev/null || true)"
+          CODE="000"
+          if [ -n "$TOKEN" ]; then
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $TOKEN" \
+              -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+              "https://ghcr.io/v2/intarweb/filament-manager/manifests/$FP")"
+          fi
+          if [ "$CODE" = "200" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Fingerprint sha-${{ steps.fp.outputs.fp }} already built — no-op, keeping current :latest." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Fingerprint $FP already published — no-op, keeping current :latest + version." | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Fingerprint $FP not found (HTTP $CODE) — building."
           fi
 
       - name: Assemble (cherry-pick open PRs onto master)
