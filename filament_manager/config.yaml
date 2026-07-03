@@ -1,6 +1,6 @@
 name: "Filament Manager (intarweb)"
 description: "Track filament inventory, print history and costs; integrates with Bambu Lab via Home Assistant. intarweb build of cgradl/filament-manager (upstream + our open PRs)."
-version: "0.39.11.9"
+version: "0.39.11.10"
 slug: "filament_manager"
 url: "https://github.com/intarweb/filament-manager"
 image: "ghcr.io/intarweb/filament-manager"
